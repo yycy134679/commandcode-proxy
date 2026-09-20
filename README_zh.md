@@ -599,12 +599,16 @@ CC 上游在高峰期会中途掐断连接（对端 RST/FIN），undici 抛 `Typ
 只要**此刻尚未向下游写出任何字节**，这个请求对下游而言从未开始过 —— 代理内部重试即可消化掉抖动，
 下游（CPA / 客户端）不必先吃一个 502 再自己重试（那等于完整重发整个上下文）。
 
-- **重试条件（需同时满足）**：① 传输层闪断（`terminated` / `ECONNRESET` / `ECONNREFUSED` / `EPIPE` /
-  `ETIMEDOUT` / `UND_ERR_SOCKET` / `socket hang up` / `other side closed` / `fetch failed`）；
+- **重试条件（需同时满足）**：① 上游没走完 —— 传输层闪断（`terminated` / `ECONNRESET` / `ECONNREFUSED` /
+  `EPIPE` / `ETIMEDOUT` / `UND_ERR_SOCKET` / `socket hang up` / `other side closed` / `fetch failed`），
+  或对端**干净收尾但整条流里没有 finish 事件**（FIN 截断，与 RST 同类）；
   ② 尚未向下游写出任何字节（流式看是否已写出 header / 事件，非流式看 `headersSent`）；
   ③ 客户端没断连；④ 未达重试上限。
 - 一旦已经向下游写过头或事件，**绝不重试**：语义已提交，重试只会让下游看到重复文本。
 - `STREAM_IDLE_TIMEOUT`（`429`「请减少上下文」）是刻意传给下游的信号，**不重试**。
+- 已解析到上游 `error` 事件（`429` / `503` 等）时**不重试**：连接随后再断，也优先把这条语义错误透出，
+  而不是用传输层错误覆盖成 `502`（把「上游容量不足」说成「代理挂了」是误导）。
+- 退避期间客户端断连 → 放弃重试（下游已经走了，再打一次上游只是白烧额度）。
 - 重试对下游完全透明：下游只看到一次 200（内容来自重试成功的那一次）。
 
 | 环境变量 | 默认 | 说明 |
@@ -612,8 +616,10 @@ CC 上游在高峰期会中途掐断连接（对端 RST/FIN），undici 抛 `Typ
 | `CC_UPSTREAM_RETRY_MAX` | `2` | 最大重试次数（共 3 次尝试）；`0` = 关闭本行为 |
 | `CC_UPSTREAM_RETRY_BASE_MS` | `400` | 退避基数（毫秒），实际退避 = base × 尝试序号 |
 
-日志里可复盘：`Upstream stream terminated before first byte - retrying` / `Upstream error before first byte - retrying`
-（发生了一次重试，`attempt` / `maxAttempts` / `cause` 都在结构体里）、`Upstream retry recovered`（重试后成功交付）；
+日志里可复盘：`Upstream stream terminated before first byte - retrying` / `Upstream error before first byte - retrying` /
+`Upstream stream ended incomplete before first byte - retrying`（发生了一次重试，`attempt` / `maxAttempts` / `cause`
+或 `reason` 都在结构体里）、`Upstream retry recovered`（重试后**确实**交付了正常响应）、
+`Upstream retry abandoned (client disconnected during backoff)`（退避期间客户端走了，放弃重试）；
 启动横幅的 `upstreamRetry` 字段可直接确认生效值。
 
 ```bash

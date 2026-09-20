@@ -596,13 +596,19 @@ The CC upstream sometimes kills a connection mid-stream at peak hours (peer RST/
 As long as **no byte has been written downstream yet**, the request never started from the client's point of view —
 so the proxy can absorb the blip internally instead of making the client eat a 502 and resend its whole context.
 
-- **Retry requires all four**: ① a transport-level drop (`terminated` / `ECONNRESET` / `ECONNREFUSED` / `EPIPE` /
-  `ETIMEDOUT` / `UND_ERR_SOCKET` / `socket hang up` / `other side closed` / `fetch failed`); ② nothing written
-  downstream yet (streaming: no header/event emitted; non-streaming: `headersSent` still false); ③ the client is still
-  connected; ④ the retry cap is not reached.
+- **Retry requires all four**: ① the upstream did not finish — either a transport-level drop (`terminated` /
+  `ECONNRESET` / `ECONNREFUSED` / `EPIPE` / `ETIMEDOUT` / `UND_ERR_SOCKET` / `socket hang up` / `other side closed` /
+  `fetch failed`), or a **clean peer FIN that carried no `finish` event at all** (the same class of truncation as an
+  RST); ② nothing written downstream yet (streaming: no header/event emitted; non-streaming: `headersSent` still
+  false); ③ the client is still connected; ④ the retry cap is not reached.
 - Once any header or event has gone downstream, the proxy **never retries** — the semantics are already committed and a
   retry would duplicate text.
 - `STREAM_IDLE_TIMEOUT` (the `429` "reduce your context" signal) is deliberately passed through and is **never retried**.
+- If an upstream `error` event (`429` / `503` …) has already been parsed, the proxy does **not** retry, and if the
+  connection then drops it still surfaces that semantic error instead of overwriting it with a transport `502`
+  (reporting "upstream at capacity" as "the proxy broke" would be misleading).
+- A client that disconnects during the backoff abandons the retry — the client is gone, another upstream call would
+  only burn quota.
 - Retries are invisible to the client: it sees a single `200` whose body comes from the attempt that succeeded.
 
 | Env var | Default | Description |
@@ -610,9 +616,11 @@ so the proxy can absorb the blip internally instead of making the client eat a 5
 | `CC_UPSTREAM_RETRY_MAX` | `2` | Max retries (3 attempts in total); `0` disables the behaviour |
 | `CC_UPSTREAM_RETRY_BASE_MS` | `400` | Backoff base in ms; the actual delay is base × attempt number |
 
-Logs to look for: `Upstream stream terminated before first byte - retrying` / `Upstream error before first byte - retrying`
-(a retry happened; `attempt` / `maxAttempts` / `cause` are in the structured fields) and `Upstream retry recovered`
-(the retry delivered). The startup banner's `upstreamRetry` field shows the effective values.
+Logs to look for: `Upstream stream terminated before first byte - retrying` / `Upstream error before first byte - retrying` /
+`Upstream stream ended incomplete before first byte - retrying` (a retry happened; `attempt` / `maxAttempts` / `cause`
+or `reason` are in the structured fields), `Upstream retry recovered` (the retry **actually delivered** a normal
+response) and `Upstream retry abandoned (client disconnected during backoff)`. The startup banner's `upstreamRetry`
+field shows the effective values.
 
 ```bash
 CC_UPSTREAM_RETRY_MAX=0 npm start        # disable retries (behaviour reverts to before this change)

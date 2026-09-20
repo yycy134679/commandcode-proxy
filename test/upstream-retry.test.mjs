@@ -24,6 +24,8 @@ const OK_LINES = [
  *   'ok'              正常吐完（下游应看到 recovered）
  *   'cut-before-byte' 写一个内部事件后 RST —— 代理尚未向下游写过任何字节
  *   'cut-after-byte'  先吐一个 text-delta（代理已转发给下游）再 RST
+ *   'fin-short'       干净收尾（对端 FIN）但没有 finish 事件 —— 上游「没走完」
+ *   'error-then-cut'  先发语义 error 事件（429），再 RST
  *   'hang'            一个字都不写，用来触发空闲看门狗
  */
 async function startFlakyUpstream(script) {
@@ -46,6 +48,16 @@ async function startFlakyUpstream(script) {
       if (action === 'ok') {
         for (const line of OK_LINES) res.write(line + '\n');
         res.end();
+        return;
+      }
+      if (action === 'fin-short') {                        // 干净 FIN，但内容不完整
+        res.write('{"type":"start"}\n');
+        res.end();
+        return;
+      }
+      if (action === 'error-then-cut') {                   // 语义错误已到手，随后连接才断
+        res.write('{"type":"error","error":{"message":"providers are currently at capacity","statusCode":429}}\n');
+        setTimeout(() => res.socket?.destroy(), 30);
         return;
       }
       if (action === 'cut-after-byte') res.write('{"type":"text-delta","text":"partial"}\n');
@@ -152,6 +164,73 @@ test('持续闪断 → 按上限放弃，仍然如实回 502', async () => {
 });
 
 // ── ③ 配置开关 ────────────────────────────────────────────
+
+// ── ④ 「干净 FIN」也是闪断：只在未吐字时可重试 ──────────────
+
+test('上游干净收尾但没走完 finish（对端 FIN）→ 未吐字时同样重试', async () => {
+  const s = await setupRetry(['fin-short', 'ok']);
+  try {
+    const r = await s.chat(true);
+    const text = await r.text();
+    assert.equal(r.status, 200, 'FIN 截断不该直接变成下游的 502');
+    assert.match(text, /recovered/);
+    assert.equal(s.mock.state.generateCalls, 2);
+    await waitForLog(s.proxy, /Upstream stream ended incomplete before first byte - retrying/);
+  } finally { await s.close(); }
+});
+
+test('持续 FIN 截断 → 按上限放弃，且不会被误记成「重试恢复」', async () => {
+  const s = await setupRetry(['fin-short']);
+  try {
+    const r = await s.chat(true);
+    assert.equal(r.status, 502);
+    assert.equal(s.mock.state.generateCalls, 3);
+    await waitForLog(s.proxy, /ended incomplete before first byte - retrying/g, 2);
+    assert.doesNotMatch(s.proxy.logs(), /Upstream retry recovered/,
+      '两次尝试都失败了，不能记成 recovered（日志会误导线上排查）');
+  } finally { await s.close(); }
+});
+
+// ── ⑤ 上游语义错误优先于传输层错误 ──────────────────────────
+
+test('已收到语义 error 事件后再闪断 → 不重试，且回语义状态码而不是 502', async () => {
+  const s = await setupRetry(['error-then-cut', 'ok']);
+  try {
+    const r = await s.chat(true);
+    assert.equal(r.status, 429, '重试会吞掉上游有意传下来的 429；502 则是把语义错误说成代理挂了');
+    assert.equal(s.mock.state.generateCalls, 1, '语义错误不该被重试覆盖');
+    assert.doesNotMatch(s.proxy.logs(), /retrying/);
+  } finally { await s.close(); }
+});
+
+test('退避期间客户端断连 → 不再发起新的上游尝试', async () => {
+  const s = await setupRetry(['cut-before-byte', 'ok'], { CC_UPSTREAM_RETRY_BASE_MS: '900' });
+  try {
+    const ac = new AbortController();
+    const pending = fetch(`${s.proxy.base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...AUTH },
+      body: JSON.stringify({ ...CHAT, stream: true }),
+      signal: ac.signal,
+    }).catch(() => null);
+    for (let i = 0; i < 80 && s.mock.state.generateCalls === 0; i++) await sleep(25);
+    await waitForLog(s.proxy, /before first byte - retrying/);   // 确认已进入退避
+    ac.abort();
+    await pending;
+    await sleep(1200);                                          // 退避 900ms 早已过去
+    assert.equal(s.mock.state.generateCalls, 1, '断连后不得再打上游');
+    await waitForLog(s.proxy, /Upstream retry abandoned \(client disconnected during backoff\)/);
+  } finally { await s.close(); }
+});
+
+test('CC_UPSTREAM_RETRY_BASE_MS 合法值生效（启动横幅回显配置值）', async () => {
+  const s = await setupRetry(['cut-before-byte', 'ok'], { CC_UPSTREAM_RETRY_BASE_MS: '1000' });
+  try {
+    const r = await s.chat(true);
+    assert.equal(r.status, 200);
+    assert.match(s.proxy.logs(), /upstreamRetry":"2 retries, base 1000ms/, '配置值要能在启动横幅里看到');
+  } finally { await s.close(); }
+});
 
 test('CC_UPSTREAM_RETRY_MAX=0 关闭重试（行为退回改动前）', async () => {
   const s = await setupRetry(['cut-before-byte', 'ok'], { CC_UPSTREAM_RETRY_MAX: '0' });
